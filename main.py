@@ -3,6 +3,7 @@ import os
 import re
 import time
 import sqlite3
+import asyncio
 import threading
 from datetime import datetime, timezone
 from urllib.parse import quote
@@ -418,6 +419,15 @@ def run_flask():
 
 
 def main():
+    # إصلاح مهم لـ Python 3.14: إنشاء event loop جديد
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("closed")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     init_database()
 
     application = (
