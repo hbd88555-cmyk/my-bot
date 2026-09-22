@@ -79,6 +79,7 @@ last_ai_request = {}
 
 flask_app = Flask(__name__)
 
+
 @flask_app.route("/")
 def home():
     return "Bot is running!"
@@ -291,7 +292,7 @@ async def ask_ai(prompt: str, system_prompt: str | None = None):
             {"role": "user", "content": prompt},
         ],
     )
-    
+
     content = response.choices[0].message.content if response.choices else None
     if not content:
         return "⚠️ ما وصلني رد. جرب مرة ثانية."
@@ -512,36 +513,46 @@ async def arabic_aliases(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await unwatch_command(update, context)
 
 
-async def monitor_instagram_accounts(context: ContextTypes.DEFAULT_TYPE):
-    rows = get_all_watched_users()
-    if not rows:
-        return
+async def monitor_task(application):
+    await asyncio.sleep(30)
+    while True:
+        try:
+            rows = get_all_watched_users()
+            if rows:
+                grouped = {}
+                for row in rows:
+                    username = row["username"]
+                    grouped.setdefault(username, []).append(row)
 
-    grouped = {}
-    for row in rows:
-        username = row["username"]
-        grouped.setdefault(username, []).append(row)
+                for username, watchers in grouped.items():
+                    current_status = await check_instagram_username(username)
+                    if current_status == STATUS_UNKNOWN:
+                        continue
 
-    for username, watchers in grouped.items():
-        current_status = await check_instagram_username(username)
-        if current_status == STATUS_UNKNOWN:
-            continue
+                    for watcher in watchers:
+                        chat_id = watcher["chat_id"]
+                        previous_status = watcher["last_status"]
+                        update_user_status(chat_id, username, current_status)
 
-        for watcher in watchers:
-            chat_id = watcher["chat_id"]
-            previous_status = watcher["last_status"]
-            update_user_status(chat_id, username, current_status)
+                        if previous_status == STATUS_UNAVAILABLE and current_status == STATUS_EXISTS:
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"🔔 الحساب نشط الآن!\n\n@{username}\n✅ الحساب موجود على إنستغرام.",
+                                )
+                            except Exception as error:
+                                print("SEND NOTIFICATION ERROR:", error)
 
-            if previous_status == STATUS_UNAVAILABLE and current_status == STATUS_EXISTS:
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🔔 الحساب نشط الآن!\n\n@{username}\n✅ الحساب موجود على إنستغرام.",
-                    )
-                except Exception as error:
-                    print("SEND NOTIFICATION ERROR:", error)
+                    await asyncio.sleep(2)
+        except Exception as e:
+            print("Monitor error:", e)
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+
+async def post_init(application):
+    asyncio.create_task(monitor_task(application))
+    print("Monitor task started.")
 
 
 def run_flask():
@@ -555,6 +566,7 @@ def main():
     application = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
         .build()
     )
 
@@ -580,17 +592,6 @@ def main():
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, ai_message)
     )
-
-    try:
-        application.job_queue.run_repeating(
-            monitor_instagram_accounts,
-            interval=CHECK_INTERVAL_SECONDS,
-            first=30,
-            name="instagram_monitor",
-        )
-        print("JobQueue started.")
-    except Exception as e:
-        print("JobQueue error:", e)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
