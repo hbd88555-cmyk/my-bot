@@ -75,9 +75,17 @@ def telegram_loop():
             print("Main loop error:", e)
             time.sleep(5)
 
+# Start bot in background thread when module loads
+_bot_started = False
+def start_bot_thread():
+    global _bot_started
+    if not _bot_started:
+        _bot_started = True
+        t = threading.Thread(target=telegram_loop, daemon=True)
+        t.start()
+
+start_bot_thread()
+
 if __name__ == "__main__":
-    t = threading.Thread(target=telegram_loop)
-    t.daemon = True
-    t.start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
