@@ -10,11 +10,9 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_VISION_MODEL = "llama-3.2-11b-vision-preview"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
-GROQ_COMPOUND_MODEL = "groq/compound-mini"
 
 app = Flask(__name__)
 
-# ===== التخزين =====
 conversations = {}
 personalities = {}
 notes = {}
@@ -23,7 +21,6 @@ watched_accounts = {}
 checked_accounts = {}
 watch_lock = threading.Lock()
 
-# ===== الشخصيات =====
 PERSONALITIES = {
     "default": """أنت مساعد ذكي محترف، تتكلم بالعربية بأسلوب واضح ومفيد.
 
@@ -42,7 +39,6 @@ PERSONALITIES = {
     "doctor": "أنت مساعد طبي. تعطي نصائح صحية عامة وتنصح بمراجعة طبيب."
 }
 
-# ===== دوال تلغرام =====
 def send_message(chat_id, text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -96,7 +92,6 @@ def check_rate_limit(chat_id):
     rate_limit[chat_id].append(now)
     return True
 
-# ===== دوال Groq =====
 def ask_groq(chat_id, user_text):
     personality = personalities.get(chat_id, "default")
     system = PERSONALITIES.get(personality, PERSONALITIES["default"])
@@ -154,41 +149,68 @@ def transcribe_audio(audio_bytes, filename="audio.ogg"):
         return None
 
 def check_instagram(username):
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    prompt = f"""ابحث في الويب عن حساب إنستغرام بالاسم: {username}
-
-تحقق من:
-1. هل الصفحة موجودة على instagram.com/{username}؟
-2. إذا موجودة، هل الحساب نشط أم معطل؟
-
-أجب بكلمة واحدة فقط:
-- "active" إذا الحساب موجود ونشط
-- "disabled" إذا الحساب موجود لكن معطل
-- "not_found" إذا الحساب غير موجود
-
-لا تكتب أي شي ثاني."""
-    data = {"model": GROQ_COMPOUND_MODEL, "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2, "max_tokens": 200}
+    """فحص مباشر لحساب إنستغرام - يرجع: active, disabled, not_found, أو None"""
+    username = username.strip().replace("@", "").lower()
+    if not username:
+        return None
+    
+    url = f"https://www.instagram.com/{username}/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
+    }
+    
     try:
-        r = requests.post(url, headers=headers, json=data, timeout=60)
-        res = r.json()
-        if "choices" not in res:
-            print("Compound response:", res)
-            return None
-        text = res["choices"][0]["message"]["content"].lower().strip()
-        if "active" in text:
-            return "active"
-        if "disabled" in text:
-            return "disabled"
-        if "not_found" in text or "not found" in text:
+        r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        print(f"Instagram check @{username}: status={r.status_code}, size={len(r.text)}")
+        
+        if r.status_code == 404:
             return "not_found"
+        
+        if r.status_code != 200:
+            print(f"Instagram status {r.status_code} for {username}")
+            return None
+        
+        text = r.text
+        text_lower = text.lower()
+        
+        not_found_phrases = [
+            "sorry, this page isn't available",
+            "the link you followed may be broken",
+            "page not found",
+            "page isn't available"
+        ]
+        for phrase in not_found_phrases:
+            if phrase in text_lower:
+                return "not_found"
+        
+        disabled_phrases = [
+            "account has been disabled",
+            "this account has been disabled"
+        ]
+        for phrase in disabled_phrases:
+            if phrase in text_lower:
+                return "disabled"
+        
+        if 'property="og:title"' in text or 'property="og:description"' in text:
+            return "active"
+        
+        if 'al:ios:url' in text or '"username"' in text:
+            return "active"
+        
+        return None
+        
+    except requests.exceptions.Timeout:
+        print(f"Timeout: {username}")
         return None
     except Exception as e:
-        print("Compound error:", e)
+        print(f"Instagram error for {username}: {e}")
         return None
 
-# ===== قائمة إنستغرام =====
 def save_to_list(chat_id, username, status):
     if chat_id not in checked_accounts:
         checked_accounts[chat_id] = {}
@@ -229,7 +251,6 @@ def show_list(chat_id):
     msg += "💡 /insta clear — يمسح الكل"
     send_message(chat_id, msg)
 
-# ===== نظام المراقبة =====
 def add_to_watch(username, chat_id):
     with watch_lock:
         watched_accounts.setdefault(username, set()).add(chat_id)
@@ -267,7 +288,6 @@ def watcher_loop():
             print("Watcher error:", e)
             time.sleep(60)
 
-# ===== الأوامر =====
 def handle_command(chat_id, text):
     if text == "/start":
         send_message(chat_id, "أهلاً بك! 👋\n\nاكتب /help عشان تشوف الأوامر.")
@@ -303,7 +323,7 @@ def handle_command(chat_id, text):
 🖼️ دز صورة | 🎤 دز صوت""")
         return True
     if text == "/about":
-        send_message(chat_id, "🤖 Aurora AI | بوت ذكي متقدم\n\n• محادثة ذكية\n• صور وصوت\n• 7 شخصيات\n• قائمة إنستغرام\n• مراقبة تلقائية\n\nصُنع بـ ❤️")
+        send_message(chat_id, "🤖 Aurora AI\n\n• محادثة ذكية\n• صور وصوت\n• 7 شخصيات\n• فحص إنستغرام حقيقي\n• مراقبة تلقائية\n\nصُنع بـ ❤️")
         return True
     if text == "/clear":
         conversations[chat_id] = []
@@ -389,7 +409,7 @@ def handle_command(chat_id, text):
             save_to_list(chat_id, username, "not_found")
             send_message(chat_id, f"❌ @{username} — غير موجود\n\n💡 أضفته لقائمتك")
         else:
-            send_message(chat_id, "⚠️ ما كدرت أفحص. جرب بعد شوية.")
+            send_message(chat_id, f"⚠️ ما كدرت أفحص @{username}.\n\nالأسباب المحتملة:\n• إنستغرام يحجب الطلبات من السيرفرات\n• مشكلة مؤقتة في الشبكة\n\nجرب مرة ثانية بعد شوية.")
         return True
 
     if text.startswith("/watch "):
@@ -440,7 +460,6 @@ def handle_command(chat_id, text):
         return True
     return False
 
-# ===== معالجة الرسائل =====
 def process_message(chat_id, text):
     if not check_rate_limit(chat_id):
         send_message(chat_id, "⏳ تجاوزت الحد (100/ساعة).")
@@ -472,7 +491,6 @@ def process_voice(chat_id, voice):
     send_chat_action(chat_id, "typing")
     send_message(chat_id, ask_groq(chat_id, text))
 
-# ===== الحلقات =====
 def telegram_loop():
     print("Bot started...")
     offset = None
