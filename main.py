@@ -7,8 +7,8 @@ from flask import Flask
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = "llama-3.3-70b-versatile"
-GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_VISION_MODEL = "llama-3.2-11b-vision-preview"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 GROQ_COMPOUND_MODEL = "groq/compound-mini"
 
@@ -303,7 +303,7 @@ def handle_command(chat_id, text):
 🖼️ دز صورة | 🎤 دز صوت""")
         return True
     if text == "/about":
-        send_message(chat_id, "🤖 بوت ذكي متقدم\n\n⚡ Llama 3.3 70B\n• محادثة ذكية\n• صور وصوت\n• 7 شخصيات\n• قائمة إنستغرام\n• مراقبة تلقائية\n\nصُنع بـ ❤️")
+        send_message(chat_id, "🤖 Aurora AI | بوت ذكي متقدم\n\n• محادثة ذكية\n• صور وصوت\n• 7 شخصيات\n• قائمة إنستغرام\n• مراقبة تلقائية\n\nصُنع بـ ❤️")
         return True
     if text == "/clear":
         conversations[chat_id] = []
@@ -356,7 +356,6 @@ def handle_command(chat_id, text):
         send_message(chat_id, reply)
         return True
 
-    # إنستغرام
     if text == "/insta":
         show_list(chat_id)
         return True
@@ -393,7 +392,6 @@ def handle_command(chat_id, text):
             send_message(chat_id, "⚠️ ما كدرت أفحص. جرب بعد شوية.")
         return True
 
-    # المراقبة
     if text.startswith("/watch "):
         username = text.replace("/watch ", "").strip().replace("@", "").lower()
         if not username:
