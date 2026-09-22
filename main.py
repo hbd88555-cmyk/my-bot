@@ -7,7 +7,7 @@ from flask import Flask
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_VISION_MODEL = "llama-3.2-11b-vision-preview"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 GROQ_COMPOUND_MODEL = "groq/compound-mini"
