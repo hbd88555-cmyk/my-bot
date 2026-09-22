@@ -1,3 +1,4 @@
+
 import os
 import threading
 import requests
@@ -6,7 +7,7 @@ from flask import Flask
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "openai/gpt-oss-20b"
 
 app = Flask(__name__)
 
@@ -50,7 +51,11 @@ def ask_groq(user_text):
     try:
         r = requests.post(url, headers=headers, json=data, timeout=30)
         res = r.json()
-        return res["choices"][0]["message"]["content"]
+        if "choices" in res:
+            return res["choices"][0]["message"]["content"]
+        else:
+            print("Groq response:", res)
+            return f"خطأ من Groq: {res.get('error', {}).get('message', 'غير معروف')}"
     except Exception as e:
         print("Groq error:", e)
         return "عذراً، صار خطأ. جرب مرة ثانية."
@@ -75,7 +80,6 @@ def telegram_loop():
             print("Main loop error:", e)
             time.sleep(5)
 
-# Start bot in background thread when module loads
 _bot_started = False
 def start_bot_thread():
     global _bot_started
