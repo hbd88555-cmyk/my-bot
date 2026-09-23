@@ -1,12 +1,11 @@
 # ============================================================
-# Aurora AI Bot - النسخة النهائية المستقرة والسحابية
-# Python 3.12+ Compatible | Vision + Auto Translate + PostgreSQL/SQLite
+# Aurora Search AI - نسخة نظيفة بدون رموز
+# Python 3.12+ | Railway Ready
 # ============================================================
 
 import os
 import re
 import time
-import base64
 import asyncio
 import sqlite3
 import threading
@@ -14,9 +13,16 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 import httpx
+from flask import Flask
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from flask import Flask, jsonify
+
+try:
+    from duckduckgo_search import DDGS
+    SEARCH_OK = True
+except ImportError:
+    SEARCH_OK = False
+    print("duckduckgo-search غير مثبت")
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -30,566 +36,549 @@ from telegram.ext import (
 
 load_dotenv()
 
-# ============================================================
-# الإعدادات
-# ============================================================
-
-TELEGRAM_BOT_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN", "") or os.getenv("TELEGRAM_TOKEN", "")
+BOT_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN", "")
+    or os.getenv("TELEGRAM_TOKEN", "")
 ).strip()
 
 GROQ_API_KEY = (
-    os.getenv("GROQ_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
+    os.getenv("GROQ_API_KEY", "")
+    or os.getenv("OPENAI_API_KEY", "")
 ).strip()
 
-# رابط قاعدة البيانات السحابية (مثال: PostgreSQL على Supabase أو Neon)
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-CHAT_MODEL = os.getenv("CHAT_MODEL", "openai/gpt-oss-120b")
-VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.8-27b")
-LINK_MODEL = os.getenv("LINK_MODEL", "groq/compound-mini")
+CHAT_MODEL = "openai/gpt-oss-120b"
 BASE_URL = "https://api.groq.com/openai/v1"
-MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", "600"))
-DB_FILE = "bot_data.sqlite3"
+DB_FILE = "aurora_search.sqlite3"
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN غير موجود")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN غير موجود")
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY غير موجود")
 
 ai_client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url=BASE_URL)
 
+
 # ============================================================
-# الثوابت
+# Flask
 # ============================================================
-
-INSTAGRAM_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-STATUS_EXISTS = "exists"
-STATUS_UNAVAILABLE = "unavailable"
-STATUS_UNKNOWN = "unknown"
-
-STATUS_TEXT = {
-    STATUS_EXISTS: "✅ الحساب موجود",
-    STATUS_UNAVAILABLE: "❌ الحساب غير متوفر",
-    STATUS_UNKNOWN: "⚠️ تعذر التحقق حالياً",
-}
-
-USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9._]{1,30}$")
-URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
-last_ai_request = {}
-
 flask_app = Flask(__name__)
+
 
 @flask_app.route("/")
 @flask_app.route("/health")
-def health_check():
-    return jsonify({"status": "ok", "bot": "Aurora AI Running"}), 200
+def health():
+    return {"status": "ok", "bot": "Aurora Search"}, 200
+
 
 # ============================================================
-# إدارة قاعدة البيانات (يدعم PostgreSQL إذا وجد وإلا يتراجع لـ SQLite)
+# قاعدة البيانات
 # ============================================================
+def db():
+    c = sqlite3.connect(DB_FILE)
+    c.row_factory = sqlite3.Row
+    return c
 
-def utc_now() -> str:
+
+def init_db():
+    c = db()
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS watched (
+            chat_id INTEGER, username TEXT, status TEXT, ts TEXT,
+            PRIMARY KEY (chat_id, username)
+        );
+    """)
+    c.commit()
+    c.close()
+
+
+def now():
     return datetime.now(timezone.utc).isoformat()
 
-def db_connection():
-    if DATABASE_URL.startswith("postgres"):
-        import psycopg2
-        import psycopg2.extras
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.DictCursor)
-        return conn
-    else:
-        conn = sqlite3.connect(DB_FILE)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-def init_database():
-    conn = db_connection()
-    cursor = conn.cursor()
-    
-    if DATABASE_URL.startswith("postgres"):
-        query = """
-        CREATE TABLE IF NOT EXISTS watched_users (
-            chat_id BIGINT NOT NULL,
-            username VARCHAR(100) NOT NULL,
-            last_status VARCHAR(50),
-            created_at VARCHAR(100) NOT NULL,
-            updated_at VARCHAR(100) NOT NULL,
-            PRIMARY KEY (chat_id, username)
-        );
-        """
-    else:
-        query = """
-        CREATE TABLE IF NOT EXISTS watched_users (
-            chat_id INTEGER NOT NULL,
-            username TEXT NOT NULL,
-            last_status TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (chat_id, username)
-        );
-        """
-    cursor.execute(query)
-    conn.commit()
-    conn.close()
-
-def add_watched_user(chat_id: int, username: str, status: str):
-    conn = db_connection()
-    cursor = conn.cursor()
-    now = utc_now()
-    
-    if DATABASE_URL.startswith("postgres"):
-        cursor.execute(
-            """
-            INSERT INTO watched_users (chat_id, username, last_status, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (chat_id, username) 
-            DO UPDATE SET last_status = EXCLUDED.last_status, updated_at = EXCLUDED.updated_at;
-            """,
-            (chat_id, username, status, now, now),
-        )
-    else:
-        cursor.execute(
-            """
-            INSERT INTO watched_users VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(chat_id, username) DO UPDATE SET last_status=excluded.last_status, updated_at=excluded.updated_at;
-            """,
-            (chat_id, username, status, now, now),
-        )
-    conn.commit()
-    conn.close()
-
-def remove_watched_user(chat_id: int, username: str) -> bool:
-    conn = db_connection()
-    cursor = conn.cursor()
-    placeholder = "%s" if DATABASE_URL.startswith("postgres") else "?"
-    cursor.execute(
-        f"DELETE FROM watched_users WHERE chat_id = {placeholder} AND username = {placeholder}",
-        (chat_id, username),
-    )
-    conn.commit()
-    deleted = cursor.rowcount > 0
-    conn.close()
-    return deleted
-
-def get_chat_users(chat_id: int):
-    conn = db_connection()
-    cursor = conn.cursor()
-    placeholder = "%s" if DATABASE_URL.startswith("postgres") else "?"
-    cursor.execute(
-        f"SELECT username, last_status FROM watched_users WHERE chat_id = {placeholder} ORDER BY username",
-        (chat_id,),
-    )
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
-def get_all_watched_users():
-    conn = db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT chat_id, username, last_status FROM watched_users ORDER BY username")
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
-def update_user_status(chat_id: int, username: str, status: str):
-    conn = db_connection()
-    cursor = conn.cursor()
-    ph = "%s" if DATABASE_URL.startswith("postgres") else "?"
-    cursor.execute(
-        f"UPDATE watched_users SET last_status = {ph}, updated_at = {ph} WHERE chat_id = {ph} AND username = {ph}",
-        (status, utc_now(), chat_id, username),
-    )
-    conn.commit()
-    conn.close()
 
 # ============================================================
-# أدوات مساعدة
+# أدوات
 # ============================================================
+URL_RE = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
+USERNAME_RE = re.compile(r"^[a-zA-Z0-9._]{1,30}$")
 
-def normalize_username(username: str):
-    username = username.strip().replace("@", "").lower()
-    if not USERNAME_PATTERN.fullmatch(username):
-        return None
-    return username
+last_req = {}
 
-def ai_rate_limited(chat_id: int) -> bool:
-    now = time.time()
-    last = last_ai_request.get(chat_id, 0)
-    if now - last < 3:
-        return True
-    last_ai_request[chat_id] = now
-    return False
 
-# ============================================================
-# Instagram Checker
-# ============================================================
+def rate_ok(chat_id, secs=2):
+    t = time.time()
+    if t - last_req.get(chat_id, 0) < secs:
+        return False
+    last_req[chat_id] = t
+    return True
 
-async def check_instagram_username(username: str) -> str:
-    username = normalize_username(username)
-    if not username:
-        return STATUS_UNKNOWN
 
-    profile_url = f"https://www.instagram.com/{quote(username)}/"
+def clean_text(text: str) -> str:
+    """يشيل رموز Markdown من النص"""
+    if not text:
+        return ""
+    # شيل # في بداية السطر
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+    # شيل ** و __
+    text = text.replace("**", "").replace("__", "")
+    # شيل الخطوط الفاصلة (---)
+    text = re.sub(r"^-{2,}\s*$", "", text, flags=re.MULTILINE)
+    # شيل رموز الكود
+    text = text.replace("```", "").replace("`", "")
+    # شيل النجوم في البداية
+    text = re.sub(r"^\s*[*_]\s+", "", text, flags=re.MULTILINE)
+    # تحويل [نص](رابط) إلى نص - رابط
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 - \2", text)
+    # شيل المسافات الزايدة
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # شيل الأسطر الفاضية في البداية والنهاية
+    return text.strip()
 
-    try:
-        async with httpx.AsyncClient(
-            headers=INSTAGRAM_HEADERS,
-            follow_redirects=True,
-            timeout=15,
-        ) as client:
-            response = await client.get(profile_url)
-            body = response.text.lower()
-
-            if response.status_code == 404:
-                return STATUS_UNAVAILABLE
-
-            if response.status_code in (401, 403, 429, 500, 502, 503, 504):
-                return STATUS_UNKNOWN
-
-            unavailable = [
-                "sorry, this page isn't available",
-                "the link you followed may be broken",
-                "page isn't available",
-                "user not found",
-            ]
-            if any(p in body for p in unavailable):
-                return STATUS_UNAVAILABLE
-
-            escaped = re.escape(username)
-            if response.status_code == 200 and re.search(rf"instagram\.com/{escaped}/", body, re.IGNORECASE):
-                return STATUS_EXISTS
-
-            return STATUS_UNKNOWN
-
-    except Exception as e:
-        print(f"Instagram error: {e}")
-        return STATUS_UNKNOWN
 
 # ============================================================
-# AI Functions
+# AI
 # ============================================================
-
-DEFAULT_SYSTEM = (
-    "أنت Aurora AI، مساعد ذكي مفيد. "
-    "أجب بالعربية بوضوح، واستخدم اللهجة العراقية إذا كان المستخدم يستخدمها. "
-    "كن دقيقاً ومباشراً ولا تخترع معلومات."
+CLEAN_SYSTEM = (
+    "أنت مساعد ذكي عربي ودود. "
+    "اكتب بأسلوب طبيعي وسلس كأنك تحكي مع صديق. "
+    "ممنوع تماماً استخدام أي رموز تنسيق مثل: # أو * أو _ أو ` أو --- أو [ ]. "
+    "لا تستخدم عناوين بأقواس أو قوائم بنجوم. "
+    "اكتب فقرات عادية فقط. "
+    "إذا احتجت تسرد نقاط، استخدم أرقام عربية عادية (1، 2، 3) بدون أي رموز. "
+    "أجب بالعربية بوضوح ودقة."
 )
 
-async def ask_ai(prompt: str, system_prompt: str | None = None) -> str:
-    if not system_prompt:
-        system_prompt = DEFAULT_SYSTEM
+
+async def ask_ai(prompt, system=None):
+    if not system:
+        system = CLEAN_SYSTEM
     try:
-        response = await ai_client.chat.completions.create(
+        r = await ai_client.chat.completions.create(
             model=CHAT_MODEL,
-            temperature=0.3,
+            temperature=0.4,
             max_tokens=2048,
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
         )
-        content = response.choices[0].message.content if response.choices else None
-        return content.strip() if content else "⚠️ ما وصلني رد. جرب مرة ثانية."
+        content = (r.choices[0].message.content or "").strip()
+        if not content:
+            return "ما وصلني رد."
+        return clean_text(content)
     except Exception as e:
         print("AI ERROR:", e)
-        return f"❌ خطأ: {str(e)[:100]}"
+        return f"خطأ: {str(e)[:120]}"
 
-async def ask_ai_vision(image_bytes: bytes, user_prompt: str = "") -> str:
-    b64 = base64.b64encode(image_bytes).decode()
-    prompt = user_prompt if user_prompt else (
-        "اكتشف النص المكتوب داخل هذه الصورة وترجمه بدقة إلى اللغة العربية. "
-        "إذا لم تحتوِ الصورة على نص، قم بتحليل محتواها ووصف العناصر والمشهد بالتفصيل."
-    )
+
+# ============================================================
+# كشف الحاجة للبحث
+# ============================================================
+SEARCH_KEYWORDS = [
+    "أخبار", "اخبار", "اليوم", "الآن", "حالياً", "الجاري",
+    "سعر", "أسعار", "كم سعر", "مباراة", "نتيجة", "نتائج",
+    "الطقس", "الجو", "ترند", "تريند", "حديث", "جديد",
+    "آخر", "أحدث", "2026", "2025", "هذا الأسبوع", "هذا الشهر",
+    "news", "today", "price", "latest", "current",
+]
+
+
+def needs_search(text):
+    t = text.lower()
+    return any(kw.lower() in t for kw in SEARCH_KEYWORDS)
+
+
+# ============================================================
+# البحث في الويب
+# ============================================================
+def search_web(query, max_results=5):
+    if not SEARCH_OK:
+        return []
     try:
-        response = await ai_client.chat.completions.create(
-            model=VISION_MODEL,
-            temperature=0.4,
-            max_tokens=1500,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    ],
-                }
-            ],
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        return results
+    except Exception as e:
+        print("SEARCH ERROR:", e)
+        return []
+
+
+async def fetch_page_text(url, max_chars=2500):
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+            ),
+            "Accept-Language": "ar,en;q=0.9",
+        }
+        async with httpx.AsyncClient(
+            headers=headers, timeout=12, follow_redirects=True
+        ) as c:
+            r = await c.get(url)
+            if r.status_code != 200:
+                return ""
+            html = r.text
+            html = re.sub(r"<script.*?</script>", " ", html, flags=re.S | re.I)
+            html = re.sub(r"<style.*?</style>", " ", html, flags=re.S | re.I)
+            html = re.sub(r"<noscript.*?</noscript>", " ", html, flags=re.S | re.I)
+            html = re.sub(r"<[^>]+>", " ", html)
+            html = html.replace("&nbsp;", " ").replace("&amp;", "&").replace("&quot;", '"')
+            html = re.sub(r"&#\d+;", " ", html)
+            html = re.sub(r"\s+", " ", html).strip()
+            return html[:max_chars]
+    except Exception as e:
+        print(f"FETCH ERROR:", e)
+        return ""
+
+
+async def research_and_answer(chat_id, question, bot):
+    """يبحث، يفتح الصفحات، يجيب، ويعطي المصادر"""
+    try:
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except:
+        pass
+
+    results = search_web(question, max_results=5)
+    if not results:
+        return await ask_ai(question)
+
+    pages = []
+    for r in results[:3]:
+        url = r.get("href", "")
+        title = r.get("title", "")
+        if not url:
+            continue
+        try:
+            text = await fetch_page_text(url)
+            if text and len(text) > 200:
+                pages.append({"title": title, "url": url, "text": text})
+        except:
+            pass
+        if len(pages) >= 3:
+            break
+
+    if pages:
+        context = "المعلومات من الإنترنت:\n\n"
+        for i, p in enumerate(pages, 1):
+            context += f"مصدر {i}: {p['title']}\n"
+            context += f"الرابط: {p['url']}\n"
+            context += f"المحتوى: {p['text']}\n\n"
+
+        prompt = (
+            f"سؤال المستخدم: {question}\n\n"
+            f"{context}\n\n"
+            f"اكتب إجابة عربية منظمة بناءً على المصادر. "
+            f"اذكر المصادر بالروابط في النهاية. "
+            f"لا تستخدم أي رموز تنسيق."
         )
-        content = response.choices[0].message.content if response.choices else None
-        return content.strip() if content else "⚠️ ما كدرت أحلل الصورة."
-    except Exception as e:
-        print("VISION ERROR:", e)
-        return f"❌ خطأ في تحليل الصورة: {str(e)[:100]}"
+        answer = await ask_ai(prompt)
 
-async def fetch_url_text(url: str) -> str:
-    """جلب المحتوى النصي من الرابط لتقليله وتحليله"""
-    try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            res = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            if res.status_code == 200:
-                text = re.sub(r'<[^>]+>', ' ', res.text)
-                text = re.sub(r'\s+', ' ', text).strip()
-                return text[:4000]
-    except Exception as e:
-        print(f"Error fetching URL: {e}")
-    return ""
+        sources = "\n\nالمصادر:\n"
+        for i, p in enumerate(pages, 1):
+            title = p["title"][:80]
+            sources += f"{i}. {title}\n{p['url']}\n"
 
-async def ask_ai_link(url: str) -> str:
-    """جلب النص ثم تحليله بواسطة الذكاء الاصطناعي"""
-    page_text = await fetch_url_text(url)
-    
-    if not page_text:
-        prompt = f"حلل هذا الرابط وأعطني نبذة عنه بناءً على عنوانه: {url}"
+        return answer + sources
     else:
-        prompt = f"إليك المحتوى المستخرج من الرابط ({url}):\n\n{page_text}\n\nيرجى قراءته وتلخيصه بالعربية."
+        txt = "نتائج البحث:\n\n"
+        for i, r in enumerate(results, 1):
+            title = r.get("title", "")[:80]
+            url = r.get("href", "")
+            body = r.get("body", "")[:150]
+            txt += f"{i}. {title}\n{body}\n{url}\n\n"
+        return clean_text(txt)
 
-    return await ask_ai(prompt)
 
 # ============================================================
-# Handlers
+# فحص إنستا
 # ============================================================
+async def check_insta(username):
+    username = username.lower().replace("@", "").strip()
+    if not USERNAME_RE.match(username):
+        return "اليوزر غير صحيح"
+    try:
+        async with httpx.AsyncClient(
+            timeout=15, follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        ) as c:
+            r = await c.get(f"https://www.instagram.com/{quote(username)}/")
+            body = r.text.lower()
+            if r.status_code == 404:
+                return "الحساب غير متوفر"
+            for p in ["sorry, this page isn't available", "user not found", "page isn't available"]:
+                if p in body:
+                    return "الحساب غير متوفر"
+            if r.status_code == 200 and re.search(rf"instagram\.com/{re.escape(username)}/", body, re.I):
+                return "الحساب موجود"
+            return "تعذر التحقق"
+    except Exception as e:
+        print("INSTA ERROR:", e)
+        return "تعذر التحقق"
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "🤖 *أهلاً بك في Aurora AI*\n\n"
-        "أرسل أي رسالة، صورة (للترجمة والتحليل التلقائي)، أو رابط وأنا أرد عليك.\n\n"
-        "📋 *الأوامر:*\n"
-        "/ai سؤال — اسأل الذكاء الاصطناعي\n"
-        "/analyze نص — تحليل نص\n"
-        "/translate اللغة نص — ترجمة\n"
-        "/check username — فحص حساب إنستغرام\n"
-        "/watch username — حفظ ومراقبة تلقائية\n"
-        "/unwatch username — إلغاء المراقبة\n"
-        "/list — الحسابات المحفوظة"
+
+# ============================================================
+# إرسال نصوص طويلة
+# ============================================================
+async def send_long(update, text):
+    if not text:
+        return
+    text = clean_text(text)
+    if len(text) <= 4000:
+        try:
+            await update.message.reply_text(text, disable_web_page_preview=True)
+        except:
+            await update.message.reply_text(text[:4000])
+    else:
+        parts = [text[i:i+3900] for i in range(0, len(text), 3900)]
+        for part in parts:
+            await update.message.reply_text(part, disable_web_page_preview=True)
+
+
+# ============================================================
+# الأوامر
+# ============================================================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (
+        "أهلاً بك في Aurora Search AI\n\n"
+        "أرسل أي سؤال، وإذا يحتاج بحث في الإنترنت، أبحث تلقائياً وأرد عليك مع المصادر.\n\n"
+        "أمثلة:\n"
+        "شنو صار اليوم بالعراق؟\n"
+        "كم سعر البيتكوين؟\n"
+        "من هو رئيس تركيا؟\n"
+        "أحدث أخبار الذكاء الاصطناعي\n\n"
+        "أوامر البحث:\n"
+        "/search موضوع - بحث قسري\n"
+        "/news موضوع - أخبار\n"
+        "/opps مجال - فرص تقديم\n\n"
+        "أوامر إنستا:\n"
+        "/check username - فحص حساب\n"
+        "/watch username - مراقبة\n"
+        "/watching - قائمة المراقبة\n"
+        "/unwatch username - إلغاء المراقبة\n\n"
+        "/clear - مسح المحادثة"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(txt)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start_command(update, context)
 
-async def ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("الاستخدام:\n/search موضوع")
+        return
+    query = " ".join(context.args)
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"جاري البحث عن: {query}...")
+    answer = await research_and_answer(chat_id, query, context.bot)
+    await send_long(update, answer)
+
+
+async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("الاستخدام:\n/news موضوع")
+        return
+    query = " ".join(context.args)
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"جاري البحث عن أخبار: {query}...")
+    answer = await research_and_answer(chat_id, f"{query} أخبار عاجلة", context.bot)
+    await send_long(update, answer)
+
+
+async def cmd_opps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    field = " ".join(context.args) if context.args else "عام"
+    await update.message.reply_text(f"جاري البحث عن فرص في: {field}...")
+
+    queries = [
+        f"{field} منح دراسية",
+        f"{field} وظائف شاغرة",
+        f"{field} تدريب",
+    ]
+
+    txt = "فرص التقديم:\n\n"
+    for q in queries:
+        results = search_web(q, max_results=4)
+        if results:
+            txt += f"{q}:\n"
+            for r in results[:3]:
+                title = r.get("title", "")[:70]
+                url = r.get("href", "")
+                txt += f"{title}\n{url}\n"
+            txt += "\n"
+
+    await send_long(update, txt)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
+
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("تم مسح المحادثة.")
+
+
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("الاستخدام:\n/check username")
+        return
+    uname = context.args[0]
+    await update.message.reply_text(f"جاري فحص @{uname}...")
+    status = await check_insta(uname)
+    await update.message.reply_text(f"@{uname}\n{status}")
+
+
+async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("الاستخدام:\n/watch username")
+        return
+    uname = context.args[0].lower().replace("@", "")
+    if not USERNAME_RE.match(uname):
+        await update.message.reply_text("اليوزر غير صحيح.")
+        return
+    await update.message.reply_text(f"جاري فحص @{uname}...")
+    status = await check_insta(uname)
+    c = db()
+    c.execute("DELETE FROM watched WHERE chat_id = ? AND username = ?", (update.effective_chat.id, uname))
+    c.execute("INSERT INTO watched VALUES (?, ?, ?, ?)", (update.effective_chat.id, uname, status, now()))
+    c.commit()
+    c.close()
+    await update.message.reply_text(f"تم حفظ @{uname}\nالحالة: {status}\nسيتم فحصه كل 10 دقائق.")
+
+
+async def cmd_unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("الاستخدام:\n/unwatch username")
+        return
+    uname = context.args[0].lower().replace("@", "")
+    c = db()
+    cur = c.execute("DELETE FROM watched WHERE chat_id = ? AND username = ?", (update.effective_chat.id, uname))
+    c.commit()
+    n = cur.rowcount
+    c.close()
+    if n:
+        await update.message.reply_text(f"تم حذف @{uname}.")
+    else:
+        await update.message.reply_text("غير موجود.")
+
+
+async def cmd_watching(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    c = db()
+    rows = c.execute("SELECT username, status FROM watched WHERE chat_id = ?", (update.effective_chat.id,)).fetchall()
+    c.close()
+    if not rows:
+        await update.message.reply_text("لا توجد حسابات مراقبة.")
+        return
+    txt = "الحسابات المراقبة:\n\n"
+    for r in rows:
+        txt += f"@{r['username']} - {r['status']}\n"
+    await update.message.reply_text(txt)
+
+
+# ============================================================
+# المعالج الرئيسي
+# ============================================================
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     chat_id = update.effective_chat.id
     text = update.message.text
 
-    if ai_rate_limited(chat_id):
-        await update.message.reply_text("⏳ انتظر 3 ثواني.")
+    if not rate_ok(chat_id):
+        await update.message.reply_text("انتظر شوي.")
         return
 
     await update.message.chat.send_action(ChatAction.TYPING)
 
-    url_match = URL_PATTERN.search(text)
+    url_match = URL_RE.search(text)
     if url_match:
         url = url_match.group(0)
-        await update.message.reply_text(f"🔎 جاري تحليل محتوى الرابط...\n{url}")
-        answer = await ask_ai_link(url)
-        await update.message.reply_text(answer)
+        await update.message.reply_text("جاري فتح الرابط...")
+        page_text = await fetch_page_text(url, max_chars=3000)
+        if page_text:
+            prompt = f"الرابط: {url}\n\nالمحتوى:\n{page_text}\n\nلخص لي بالعربية."
+            ans = await ask_ai(prompt)
+            await send_long(update, ans)
+        else:
+            ans = await research_and_answer(chat_id, text, context.bot)
+            await send_long(update, ans)
         return
 
-    answer = await ask_ai(text)
-    await update.message.reply_text(answer)
-
-async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة الصور: الترجمة والتحليل التلقائي بذكاء"""
-    if not update.message or not update.message.photo:
+    if needs_search(text):
+        await update.message.reply_text("جاري البحث...")
+        ans = await research_and_answer(chat_id, text, context.bot)
+        await send_long(update, ans)
         return
 
-    chat_id = update.effective_chat.id
-    if ai_rate_limited(chat_id):
-        await update.message.reply_text("⏳ انتظر 3 ثواني.")
-        return
+    ans = await ask_ai(text)
+    await send_long(update, ans)
 
-    await update.message.chat.send_action(ChatAction.TYPING)
-    try:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        image_bytes = bytes(await file.download_as_bytearray())
-        
-        caption = update.message.caption or ""
-        
-        # إذا لم يرفق المستخدم أي نص مع الصورة، نعتمد تعليمات الترجمة والتحليل التلقائي
-        if not caption.strip():
-            caption = (
-                "اقرأ أي نص مكتوب أو موجود في الصورة ثم ترجمه بدقة إلى اللغة العربية. "
-                "إذا لم يكن هناك أي نص في الصورة، قم بوصف وتحليل مكوناتها بالتفصيل."
-            )
-
-        answer = await ask_ai_vision(image_bytes, caption)
-        await update.message.reply_text(answer)
-    except Exception as e:
-        print("PHOTO ERROR:", e)
-        await update.message.reply_text("❌ ما كدرت أعالج الصورة.")
-
-async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("الاستخدام:\n/ai سؤالك")
-        return
-    prompt = " ".join(context.args)
-    chat_id = update.effective_chat.id
-    if ai_rate_limited(chat_id):
-        await update.message.reply_text("⏳ انتظر 3 ثواني.")
-        return
-    await update.message.chat.send_action(ChatAction.TYPING)
-    answer = await ask_ai(prompt)
-    await update.message.reply_text(answer)
-
-async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("الاستخدام:\n/analyze نص")
-        return
-    text = " ".join(context.args)
-    chat_id = update.effective_chat.id
-    if ai_rate_limited(chat_id):
-        await update.message.reply_text("⏳ انتظر 3 ثواني.")
-        return
-    await update.message.chat.send_action(ChatAction.TYPING)
-    prompt = f"حلل النص التالي بالتفصيل:\n\n{text}\n\nأعطني: الفكرة الرئيسية، النبرة، النقاط المهمة، المخاطر، اقتراح."
-    answer = await ask_ai(prompt)
-    await update.message.reply_text(answer)
-
-async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("الاستخدام:\n/translate English نص")
-        return
-    if len(context.args) >= 2:
-        target = context.args[0]
-        text = " ".join(context.args[1:])
-    else:
-        target = "العربية"
-        text = context.args[0]
-    chat_id = update.effective_chat.id
-    if ai_rate_limited(chat_id):
-        await update.message.reply_text("⏳ انتظر 3 ثواني.")
-        return
-    await update.message.chat.send_action(ChatAction.TYPING)
-    prompt = f"ترجم النص التالي إلى {target}:\n\n{text}\n\nأرسل الترجمة فقط."
-    answer = await ask_ai(prompt, "أنت مترجم محترف.")
-    await update.message.reply_text(answer)
-
-async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("الاستخدام:\n/check username")
-        return
-    username = normalize_username(context.args[0])
-    if not username:
-        await update.message.reply_text("❌ اليوزر غير صحيح.")
-        return
-    await update.message.reply_text(f"🔎 جاري فحص @{username}...")
-    status = await check_instagram_username(username)
-    await update.message.reply_text(f"@{username}\n{STATUS_TEXT[status]}")
-
-async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("الاستخدام:\n/watch username")
-        return
-    username = normalize_username(context.args[0])
-    if not username:
-        await update.message.reply_text("❌ اليوزر غير صحيح.")
-        return
-    chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🔎 أفحص @{username}...")
-    status = await check_instagram_username(username)
-    add_watched_user(chat_id, username, status)
-    msg = (
-        f"💾 تم حفظ @{username} للمراقبة.\n"
-        f"الحالة الحالية: {STATUS_TEXT[status]}\n\n"
-        f"⏱️ سأفحصه كل {MONITOR_INTERVAL // 60} دقائق."
-    )
-    await update.message.reply_text(msg)
-
-async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("الاستخدام:\n/unwatch username")
-        return
-    username = normalize_username(context.args[0])
-    if not username:
-        await update.message.reply_text("❌ اليوزر غير صحيح.")
-        return
-    deleted = remove_watched_user(update.effective_chat.id, username)
-    if deleted:
-        await update.message.reply_text(f"🗑️ تم حذف @{username} من المراقبة.")
-    else:
-        await update.message.reply_text(f"⚠️ @{username} غير موجود.")
-
-async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = get_chat_users(update.effective_chat.id)
-    if not rows:
-        await update.message.reply_text("📭 لا توجد حسابات محفوظة.")
-        return
-    lines = ["📋 *الحسابات المراقبة:*\n"]
-    for row in rows:
-        u = row["username"]
-        s = row["last_status"] or STATUS_UNKNOWN
-        lines.append(f"• @{u} — {STATUS_TEXT.get(s, STATUS_UNKNOWN)}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 # ============================================================
-# Monitor Loop
+# المراقبة
 # ============================================================
-
-async def monitor_loop(application: Application):
+async def monitor_loop(application):
     print("Monitor started.")
-    await asyncio.sleep(30)
+    await asyncio.sleep(20)
+    counter = 0
     while True:
         try:
-            rows = get_all_watched_users()
-            if not rows:
-                await asyncio.sleep(MONITOR_INTERVAL)
-                continue
-            grouped: dict = {}
-            for row in rows:
-                grouped.setdefault(row["username"], []).append(row)
-            for username, watchers in grouped.items():
-                try:
-                    current = await check_instagram_username(username)
-                except Exception as e:
-                    print(f"Check failed: {e}")
-                    continue
-                if current == STATUS_UNKNOWN:
-                    continue
-                for watcher in watchers:
-                    chat_id = watcher["chat_id"]
-                    previous = watcher["last_status"]
-                    update_user_status(chat_id, username, current)
-                    if previous in (STATUS_UNAVAILABLE, None) and current == STATUS_EXISTS:
-                        try:
-                            await application.bot.send_message(
-                                chat_id=chat_id,
-                                text=f"🔔 *خبر حلو!*\n\n@{username} صار متوفراً!\n🔗 https://instagram.com/{username}",
-                                parse_mode="Markdown",
-                            )
-                        except Exception as e:
-                            print(f"Notify failed: {e}")
-                await asyncio.sleep(2)
+            counter += 60
+            if counter >= 600:
+                counter = 0
+                c = db()
+                rows = c.execute("SELECT chat_id, username, status FROM watched").fetchall()
+                c.close()
+                grouped = {}
+                for row in rows:
+                    grouped.setdefault(row["username"], []).append(row)
+
+                for uname, watchers in grouped.items():
+                    try:
+                        status = await check_insta(uname)
+                    except:
+                        continue
+                    if "تعذر" in status:
+                        continue
+                    for w in watchers:
+                        prev = w["status"]
+                        c2 = db()
+                        c2.execute(
+                            "UPDATE watched SET status = ?, ts = ? WHERE chat_id = ? AND username = ?",
+                            (status, now(), w["chat_id"], uname),
+                        )
+                        c2.commit()
+                        c2.close()
+                        if "غير متوفر" in prev and "موجود" in status:
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=w["chat_id"],
+                                    text=f"خبر حلو!\n\n@{uname} صار متوفراً على إنستغرام.\nhttps://instagram.com/{uname}",
+                                )
+                            except:
+                                pass
+
+            await asyncio.sleep(60)
         except Exception as e:
             print(f"Monitor error: {e}")
-        await asyncio.sleep(MONITOR_INTERVAL)
+            await asyncio.sleep(60)
 
-async def post_init(application: Application):
+
+async def post_init(application):
     asyncio.create_task(monitor_loop(application))
 
-# ============================================================
-# Flask Server
-# ============================================================
 
+# ============================================================
+# Flask thread
+# ============================================================
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
 
-# ============================================================
-# Main Execution
-# ============================================================
 
+# ============================================================
+# main
+# ============================================================
 def main():
     try:
         loop = asyncio.get_event_loop()
@@ -599,37 +588,30 @@ def main():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    init_database()
+    init_db()
+    print("Aurora Search AI started...")
 
-    application = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("ai", ai_command))
-    application.add_handler(CommandHandler("analyze", analyze_command))
-    application.add_handler(CommandHandler("translate", translate_command))
-    application.add_handler(CommandHandler("check", check_command))
-    application.add_handler(CommandHandler("watch", watch_command))
-    application.add_handler(CommandHandler("unwatch", unwatch_command))
-    application.add_handler(CommandHandler("list", list_command))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("news", cmd_news))
+    app.add_handler(CommandHandler("opps", cmd_opps))
+    app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("watch", cmd_watch))
+    app.add_handler(CommandHandler("unwatch", cmd_unwatch))
+    app.add_handler(CommandHandler("watching", cmd_watching))
 
-    application.add_handler(MessageHandler(filters.PHOTO, photo_message))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    print("Flask started.")
-    print("Bot started...")
-    
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+
+    print("Bot is running...")
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
