@@ -615,3 +615,103 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ============================================================
+# دعم الصور - يوصف ويترجم محتوى الصورة
+# ============================================================
+
+import base64
+
+# قائمة موديلات الرؤية (نجربهم بالترتيب حتى واحد يشتغل)
+VISION_MODELS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview",
+    "qwen/qwen3-vl-27b-instruct",
+]
+
+VISION_PROMPT = (
+    "اقرأ أي نص موجود داخل هذه الصورة، ثم ترجمه إلى العربية. "
+    "إذا كانت الصورة تحتوي على مشهد، اوصفها بالتفصيل بالعربية. "
+    "لا تستخدم رموز تنسيق مثل # أو * أو -. "
+    "اكتب بأسلوب طبيعي وسلس."
+)
+
+
+async def try_vision_model(model_name, image_bytes, prompt):
+    """يحاول موديل رؤية واحد"""
+    try:
+        b64 = base64.b64encode(image_bytes).decode()
+        response = await ai_client.chat.completions.create(
+            model=model_name,
+            temperature=0.4,
+            max_tokens=1500,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64}"
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        content = response.choices[0].message.content if response.choices else None
+        if content and content.strip():
+            return content.strip()
+        return None
+    except Exception as e:
+        print(f"VISION ({model_name}) ERROR: {str(e)[:150]}")
+        return None
+
+
+async def cmd_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يعالج الصور: يوصف ويترجم محتواها"""
+    if not update.message or not update.message.photo:
+        return
+
+    chat_id = update.effective_chat.id
+    await update.message.chat.send_action(ChatAction.TYPING)
+    await update.message.reply_text("جاري قراءة الصورة...")
+
+    try:
+        # ناخذ أكبر حجم
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = bytes(await file.download_as_bytearray())
+
+        # نص مرفق مع الصورة إن وجد
+        caption = update.message.caption or ""
+        if caption.strip():
+            prompt = f"طلب المستخدم: {caption}\n\n{VISION_PROMPT}"
+        else:
+            prompt = VISION_PROMPT
+
+        # نجرب كل الموديلات بالترتيب
+        answer = None
+        used_model = None
+        for model in VISION_MODELS:
+            print(f"Trying vision model: {model}")
+            answer = await try_vision_model(model, image_bytes, prompt)
+            if answer:
+                used_model = model
+                break
+
+        if answer:
+            answer = clean_text(answer)
+            await send_long(update, answer)
+        else:
+            await update.message.reply_text(
+                "ما كدرت أقرأ الصورة حالياً. "
+                "يمكن موديلات الرؤية متوقفة من Groq. "
+                "جرب مرة ثانية بعد شوي."
+            )
+
+    except Exception as e:
+        print("PHOTO ERROR:", e)
+        await update.message.reply_text("صار خطأ في معالجة الصورة.")
