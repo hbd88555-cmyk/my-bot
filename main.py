@@ -44,9 +44,9 @@ GROQ_API_KEY = (
     or os.getenv("OPENAI_API_KEY", "")
 ).strip()
 
-CHAT_MODEL = os.getenv("CHAT_MODEL", "openai/gpt-oss-120b")
-VISION_MODEL = os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "openai/gpt-oss-120b"
 BASE_URL = "https://api.groq.com/openai/v1"
+VISION_MODEL = os.getenv("VISION_MODEL", "meta-llama/llama-4-maverick-17b-128e-instruct")
 
 MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", "600"))
 DB_FILE = "bot_data.sqlite3"
